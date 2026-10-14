@@ -397,23 +397,47 @@ pub(super) fn hurt_hero(run: &mut Run, raw: f32) -> f32 {
     dmg
 }
 
-/// The clock, regeneration, the timed buffs and their visuals, death and victory.
+/// The clock, regeneration, the timed buffs and their visuals, death and victory. In co-op a
+/// fallen hero rises beside a standing friend after [`super::coop::REVIVE_SECS`]; the run ends
+/// only when nobody is left standing.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hero_vitals(
     time: Res<Time>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
-    mut hero: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks), With<Hero>>,
+    mut hero: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks, &mut Transform), With<Hero>>,
     mut fields: MessageWriter<FieldChanged>,
     mut fx: Fx,
+    mut coop: ResMut<super::coop::Coop>,
+    mut hits: MessageWriter<super::abilities::Hit>,
 ) {
     let dt = time.delta_secs();
     let stats = run.stats();
-    let Ok((entity, guid, mut store, mut marks)) = hero.single_mut() else {
+    let Ok((entity, guid, mut store, mut marks, mut tf)) = hero.single_mut() else {
         return;
     };
+    super::coop::take_blows(&mut coop, &mut run, entity, &mut fx, &mut hits);
     if let Some(t) = run.dead_t.as_mut() {
         *t += dt;
-        if *t > 3.0 {
+        let fallen = *t;
+        if coop.on && coop.ally_standing() {
+            // The run goes on around the fallen hero.
+            run.elapsed += dt;
+            let left = (super::coop::REVIVE_SECS - fallen).ceil().max(0.0);
+            if fallen < super::coop::REVIVE_SECS {
+                run.banner = Some((format!("You rise again in {left} s..."), 0.3));
+            } else if let Some(at) = super::coop::rise_beside(&coop) {
+                run.dead_t = None;
+                run.hp = stats.max_hp * 0.5;
+                run.immune_t = 2.0;
+                tf.translation = at;
+                units::revive_unit(&mut store);
+                fx.cast(entity, 2006, &[entity], None);
+                run.banner = Some(("Back on your feet!".into(), 2.0));
+            }
+            return;
+        }
+        if fallen > 3.0 {
             next.set(Phase::GameOver);
         }
         return;

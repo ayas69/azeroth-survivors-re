@@ -153,6 +153,15 @@ pub(super) fn kill_unit(store: &mut ObjectStore) {
         .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 0)]));
 }
 
+/// A fallen unit stands again (co-op: a friend's hero rising).
+pub(super) fn revive_unit(store: &mut ObjectStore) {
+    if store.0.unit_health() == Some(0) {
+        store
+            .0
+            .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 100)]));
+    }
+}
+
 /// A dynamic object, as a ground spell's server would place it: the dest-effect systems arm the
 /// spell's area visuals on it.
 pub(super) fn spawn_area_object(

@@ -35,6 +35,8 @@ pub(super) struct Enemy {
     pub weaken_t: f32,
     pub dots: Vec<Dot>,
     pub dead: bool,
+    /// The co-op friend who struck last, 0 for this tab's own hero: the kill is theirs.
+    pub last_from: u32,
 }
 
 pub(super) struct Dot {
@@ -102,6 +104,21 @@ fn spawn_enemy(
     boss: bool,
 ) {
     let scale = data::hp_scale(run.elapsed);
+    let hp = def.hp * scale;
+    let damage = def.damage * data::damage_scale(run.elapsed);
+    spawn_mirror(commands, run, def, pos, hero, boss, (hp, hp, damage));
+}
+
+/// An enemy with the numbers given: the host's own as it scales them, or a guest's mirror of one.
+pub(super) fn spawn_mirror(
+    commands: &mut Commands,
+    run: &mut Run,
+    def: &'static EnemyDef,
+    pos: Vec3,
+    hero: Vec3,
+    boss: bool,
+    (hp, max_hp, damage): (f32, f32, f32),
+) -> Entity {
     let serial = run.guid();
     let e = units::spawn_unit(
         commands,
@@ -118,14 +135,13 @@ fn spawn_enemy(
         pos,
         yaw_toward(hero - pos),
     );
-    let hp = def.hp * scale;
     commands.entity(e).insert((
         Enemy {
             def,
             hp,
-            max_hp: hp,
+            max_hp,
             speed: def.speed,
-            damage: def.damage * data::damage_scale(run.elapsed),
+            damage,
             radius: radius_for(def),
             xp: def.xp,
             boss,
@@ -139,9 +155,11 @@ fn spawn_enemy(
             weaken_t: 0.0,
             dots: Vec::new(),
             dead: false,
+            last_from: 0,
         },
         Marks::debuffs(),
     ));
+    e
 }
 
 fn ground(world: &WorldPoint, mut p: Vec3, fallback: f32) -> Vec3 {
@@ -161,12 +179,20 @@ pub(super) fn spawn_enemies(
     hero: Query<&Transform, With<Hero>>,
     enemies: Query<&Enemy>,
     world: WorldPoint,
+    coop: Res<super::coop::Coop>,
 ) {
-    let Ok(h) = hero.single() else { return };
-    if run.dead_t.is_some() {
+    if coop.guest {
         return;
     }
-    let hpos = h.translation;
+    // The horde gathers round a hero still standing: this one, or in co-op any friend.
+    let mut anchors: Vec<Vec3> = coop.mate_targets().map(|(_, p, _)| p).collect();
+    if let (Ok(h), None) = (hero.single(), run.dead_t) {
+        anchors.push(h.translation);
+    }
+    if anchors.is_empty() {
+        return;
+    }
+    let hpos = anchors[rng.index(anchors.len())];
     let elapsed = run.elapsed;
     let roster = data::roster(selection.map);
     let pool = data::wave_pool(elapsed, roster.enemies.len());
@@ -216,6 +242,7 @@ pub(super) fn spawn_enemies(
     let n = (((target - alive) as f32) / 6.0).ceil().min(4.0) as usize;
     for _ in 0..n {
         let def = &roster.enemies[pool[rng.index(pool.len())]];
+        let hpos = anchors[rng.index(anchors.len())];
         let a = rng.range(0.0, std::f32::consts::TAU);
         let r = rng.range(34.0, 42.0);
         let pos = ground(&world, hpos + Vec3::new(a.cos(), 0.0, a.sin()) * r, hpos.y);
@@ -223,34 +250,55 @@ pub(super) fn spawn_enemies(
     }
 }
 
-/// The chase: straight at the hero, pushed apart from each other, stopped by crowd control, and
-/// swinging when in reach.
-#[allow(clippy::type_complexity)]
+/// The chase: straight at the nearest hero standing (in co-op, a friend's too), pushed apart from
+/// each other, stopped by crowd control, and swinging when in reach. A guest's horde is the
+/// host's, mirrored: it does not move here.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn move_enemies(
     time: Res<Time>,
     mut run: ResMut<Run>,
     world: WorldPoint,
     hero: Query<(Entity, &Transform), (With<Hero>, Without<Enemy>)>,
-    mut enemies: Query<(Entity, &mut Transform, &mut Enemy, &mut MovementState), Without<Hero>>,
+    mut enemies: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut Enemy,
+            &mut MovementState,
+            Option<&super::coop::NetId>,
+        ),
+        Without<Hero>,
+    >,
     mut fx: Fx,
     mut hits: MessageWriter<Hit>,
+    mut coop: ResMut<super::coop::Coop>,
 ) {
     let dt = time.delta_secs();
-    if dt <= 0.0 {
+    if dt <= 0.0 || coop.guest {
         return;
     }
-    let Ok((hero_e, htf)) = hero.single() else {
+    // Every hero on its feet: this tab's own (friend 0) and, in co-op, the friends'.
+    let mut targets: Vec<(u32, Vec3, Option<Entity>)> = coop.mate_targets().collect();
+    if let (Ok((e, tf)), None) = (hero.single(), run.dead_t) {
+        targets.push((0, tf.translation, Some(e)));
+    }
+    if targets.is_empty() {
+        // Nobody standing: the horde stops where it is.
+        for (_, _, _, mut mv, _) in &mut enemies {
+            if mv.speed != 0.0 || mv.flags != 0 {
+                mv.speed = 0.0;
+                mv.flags = 0;
+            }
+        }
         return;
-    };
-    let hpos = htf.translation;
-    let hero_down = run.dead_t.is_some();
+    }
 
     // Separation over a coarse grid: only neighbours in the same or adjacent cells push.
     const CELL: f32 = 3.0;
     let bodies: Vec<(Entity, Vec3, f32)> = enemies
         .iter()
-        .filter(|(_, _, e, _)| !e.dead)
-        .map(|(ent, tf, e, _)| (ent, tf.translation, e.radius))
+        .filter(|(_, _, e, ..)| !e.dead)
+        .map(|(ent, tf, e, ..)| (ent, tf.translation, e.radius))
         .collect();
     let key = |p: Vec3| ((p.x / CELL).floor() as i32, (p.z / CELL).floor() as i32);
     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -285,7 +333,7 @@ pub(super) fn move_enemies(
         push.insert(ent, acc);
     }
 
-    for (ent, mut tf, mut e, mut mv) in &mut enemies {
+    for (ent, mut tf, mut e, mut mv, net_id) in &mut enemies {
         let e = &mut *e;
         if e.dead {
             if mv.speed != 0.0 || mv.flags != 0 {
@@ -311,6 +359,16 @@ pub(super) fn move_enemies(
             e.weaken = 1.0;
         }
         let pos = tf.translation;
+        // The nearest hero standing is the one it goes for.
+        let (who, hpos, victim) = targets
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                flat(a.1 - pos)
+                    .length_squared()
+                    .total_cmp(&flat(b.1 - pos).length_squared())
+            })
+            .unwrap_or(targets[0]);
         let to_hero = flat(hpos - pos);
         let dist = to_hero.length();
 
@@ -322,12 +380,12 @@ pub(super) fn move_enemies(
         }
 
         // Under Fade the horde has lost the hero: it mills where it stands.
-        let lost = run.mobile.vanish_t > 0.0 && !e.boss;
+        let lost = who == 0 && run.mobile.vanish_t > 0.0 && !e.boss;
         let held = e.stun_t > 0.0 || e.root_t > 0.0 || lost;
         let contact = dist <= HERO_RADIUS + e.radius + 0.35;
         let mut step = Vec3::ZERO;
         let mut speed = 0.0;
-        if !held && !hero_down {
+        if !held {
             let dir = if e.fear_t > 0.0 {
                 -to_hero.normalize_or_zero()
             } else {
@@ -354,15 +412,20 @@ pub(super) fn move_enemies(
             mv.flags = 0;
         }
 
-        if contact
-            && !lost
-            && e.stun_t <= 0.0
-            && e.fear_t <= 0.0
-            && e.attack_cd <= 0.0
-            && !hero_down
-        {
+        if contact && !lost && e.stun_t <= 0.0 && e.fear_t <= 0.0 && e.attack_cd <= 0.0 {
             e.attack_cd = if e.boss { 1.0 } else { 1.3 };
             let raw = e.damage * e.weaken;
+            if who != 0 {
+                // A friend's hero: the blow is theirs to take, on their own armour and shield.
+                if let Some(id) = net_id {
+                    coop.send_to(who, super::coop::Msg::Hurt { by: id.0, raw });
+                }
+                if let Some(v) = victim {
+                    fx.swing(ent, v, raw);
+                }
+                continue;
+            }
+            let Some(hero_e) = victim else { continue };
             let taken = hero::hurt_hero(&mut run, raw);
             fx.swing(ent, hero_e, taken);
             if taken > 0.0 {
@@ -438,7 +501,33 @@ pub(super) fn drop_loot(
     }
 }
 
-fn spawn_gem(commands: &mut Commands, serial: u64, pos: Vec3, kind: GemKind) {
+impl Gem {
+    /// `(experience, health)` this pickup is worth, for the co-op messages.
+    pub(super) fn amounts(&self) -> (u32, f32) {
+        match self.kind {
+            GemKind::Xp(xp) => (xp, 0.0),
+            GemKind::Heal(hp) => (0, hp),
+        }
+    }
+}
+
+/// A guest's mirror of the host's pickup.
+pub(super) fn spawn_mirror_gem(
+    commands: &mut Commands,
+    run: &mut Run,
+    pos: Vec3,
+    xp: u32,
+    heal: f32,
+) -> Entity {
+    let kind = if heal > 0.0 {
+        GemKind::Heal(heal)
+    } else {
+        GemKind::Xp(xp)
+    };
+    spawn_gem(commands, run.guid(), pos - Vec3::Y * 0.5, kind)
+}
+
+fn spawn_gem(commands: &mut Commands, serial: u64, pos: Vec3, kind: GemKind) -> Entity {
     let (display, scale) = look_for(kind);
     let e = units::spawn_object(commands, serial, display, scale, pos + Vec3::Y * 0.5);
     commands.entity(e).insert(Gem {
@@ -446,6 +535,7 @@ fn spawn_gem(commands: &mut Commands, serial: u64, pos: Vec3, kind: GemKind) {
         pulled: false,
         speed: 6.0,
     });
+    e
 }
 
 /// Gems in the magnet's reach fly to the hero; levels bank as they land.
@@ -455,16 +545,24 @@ pub(super) fn collect_gems(
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
     hero: Query<&Transform, (With<Hero>, Without<Gem>)>,
-    mut gems: Query<(Entity, &mut Transform, &mut Gem)>,
+    mut gems: Query<(Entity, &mut Transform, &mut Gem, Option<&super::coop::NetId>)>,
+    mut coop: ResMut<super::coop::Coop>,
 ) {
     let Ok(h) = hero.single() else { return };
+    let stats = run.stats();
+    // Friends' wisps count here too, fallen or not, each at this hero's own growth.
+    if coop.shared_xp > 0 {
+        run.xp += std::mem::take(&mut coop.shared_xp) as f32 * data::XP_RATE * stats.growth;
+    }
+    if coop.credited > 0 {
+        run.kills += std::mem::take(&mut coop.credited);
+    }
     if run.dead_t.is_some() {
         return;
     }
     let dt = time.delta_secs();
-    let stats = run.stats();
     let target = h.translation + Vec3::Y * 1.0;
-    for (e, mut tf, mut g) in &mut gems {
+    for (e, mut tf, mut g, id) in &mut gems {
         let d = target - tf.translation;
         let dist = d.length();
         if !g.pulled && flat(d).length() <= stats.magnet {
@@ -474,6 +572,12 @@ pub(super) fn collect_gems(
             continue;
         }
         if dist < 0.9 {
+            if let Some(id) = id {
+                coop.took.insert(id.0);
+                coop.net.remove(&id.0);
+                let (xp, _) = g.amounts();
+                coop.send(super::coop::Msg::Took { id: id.0, xp });
+            }
             match g.kind {
                 GemKind::Xp(xp) => run.xp += xp as f32 * data::XP_RATE * stats.growth,
                 GemKind::Heal(hp) => run.hp = (run.hp + hp).min(stats.max_hp),

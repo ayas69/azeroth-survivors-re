@@ -64,6 +64,20 @@
   // credentials itself sets `window.__wenilla_env = {user, pass, host}` here instead, and the
   // client then never reads credentials from the URL (`benilla_app::webenv`).
   window.__wenilla_env = { dev_query_creds: '1' };
+  // Co-op: the name friends see over this hero, asked once and kept (`?name=` overrides it).
+  // Picking the same battleground as a friend is how runs meet (`survivors::coop`).
+  (() => {
+    const KEY = 'azs-coop-name';
+    let name = new URLSearchParams(location.search).get('name');
+    try { name = name || localStorage.getItem(KEY); } catch (_) {}
+    while (!name || !name.trim()) {
+      name = prompt('Your name, for your friends to see (letters and numbers):', '');
+      if (name === null) { name = 'Hero'; break; }
+    }
+    name = name.trim().replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 16) || 'Hero';
+    try { localStorage.setItem(KEY, name); } catch (_) {}
+    window.__wenilla_env.coop_name = name;
+  })();
 </script>
 <script type="module">
   import init from './wenilla.js';

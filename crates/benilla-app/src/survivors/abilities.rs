@@ -24,6 +24,8 @@ pub(super) struct Hit {
     pub splash: f32,
     pub crit: bool,
     pub color: u32,
+    /// The co-op friend whose spell this was, 0 for this tab's own hero.
+    pub from: u32,
 }
 
 impl Hit {
@@ -39,6 +41,7 @@ impl Hit {
             splash: 0.0,
             crit,
             color: COLOR_MELEE,
+            from: 0,
         }
     }
 }
@@ -122,6 +125,7 @@ fn hit_for(def: &AbilityDef, p: &Params, target: Entity, damage: f32, crit: bool
         } else {
             COLOR_SPELL
         },
+        from: 0,
     }
 }
 
@@ -589,6 +593,7 @@ pub(super) fn tick_areas(
                     splash: 0.0,
                     crit,
                     color: COLOR_SPELL,
+                    from: 0,
                 });
             }
         }
@@ -656,10 +661,13 @@ pub(super) fn tick_areas(
 
 /// Land every hit due: damage and its number, the over-time part, crowd control, the marks, and
 /// death with its loot.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_hits(
     mut commands: Commands,
     time: Res<Time>,
     mut run: ResMut<Run>,
+    mut coop: ResMut<super::coop::Coop>,
+    ids: Query<&super::coop::NetId>,
     mut pending: ResMut<PendingHits>,
     mut incoming: MessageReader<Hit>,
     mut enemies: Query<(
@@ -708,8 +716,31 @@ pub(super) fn apply_hits(
         all.push(Hit { splash: 0.0, ..h });
     }
 
+    // A guest's blows are the host's to land: off they go, with this tab's own numbers shown.
+    if coop.guest {
+        for h in all {
+            let Ok(id) = ids.get(h.target) else { continue };
+            if enemies.get(h.target).is_ok_and(|(.., en, _, _)| en.dead) {
+                continue;
+            }
+            if h.damage > 0.0 {
+                run.damage_done += f64::from(h.damage);
+                fx.number(h.target, h.damage, h.crit, h.color);
+                if let Effect::Drain(frac) = h.effect {
+                    let max = run.stats().max_hp;
+                    run.hp = (run.hp + h.damage * frac).min(max);
+                }
+            }
+            coop.forward_hit(id.0, &h);
+        }
+        return;
+    }
+
     let mut kill =
         |commands: &mut Commands, run: &mut Run, e: Entity, pos: Vec3, en: &mut Enemy| {
+            if let Ok(id) = ids.get(e) {
+                coop.died(id.0, en.last_from);
+            }
             en.dead = true;
             en.hp = 0.0;
             en.dots.clear();
@@ -719,7 +750,9 @@ pub(super) fn apply_hits(
                 xp: en.xp,
                 boss: en.boss,
             });
-            run.kills += 1;
+            if en.last_from == 0 {
+                run.kills += 1;
+            }
             if en.boss {
                 run.banner = Some((format!("{} is slain!", en.def.name), 3.0));
             }
@@ -732,6 +765,7 @@ pub(super) fn apply_hits(
         if en.dead {
             continue;
         }
+        en.last_from = h.from;
         let mut dmg = h.damage;
         if let Effect::Execute(threshold) = h.effect {
             if !en.boss && en.hp / en.max_hp <= threshold {
@@ -740,9 +774,11 @@ pub(super) fn apply_hits(
         }
         if dmg > 0.0 {
             en.hp -= dmg;
-            run.damage_done += f64::from(dmg);
+            if h.from == 0 {
+                run.damage_done += f64::from(dmg);
+            }
             fx.number(e, dmg, h.crit, h.color);
-            if let Effect::Drain(frac) = h.effect {
+            if let (0, Effect::Drain(frac)) = (h.from, h.effect) {
                 let max = run.stats().max_hp;
                 run.hp = (run.hp + dmg * frac).min(max);
             }

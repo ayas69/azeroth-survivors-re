@@ -56,6 +56,8 @@ benilla-protocol = { path = "../benilla-protocol" }
 benilla-world = { path = "../benilla-world", default-features = false }
 # The CVar diff persisted in `benilla-config/config.toml`.
 serde = { version = "1", features = ["derive"] }
+# The survivors co-op messages (`survivors::coop`), JSON over the relay's WebSocket.
+serde_json = "1"
 toml = "0.8"
 # Collision for our kinematic character controller; 0.6 targets Bevy 0.18, 0.7 moves to 0.19.
 avian3d = "0.6"
@@ -82,6 +84,8 @@ rand = "0.8"
 # arboard has no wasm32 backend (`textinput/clipboard.rs` falls back to no pasteboard there).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 arboard = "3"
+# The survivors co-op link on the desktop: a blocking WebSocket on its own thread (`survivors::coop::link`).
+tungstenite = "0.30"
 
 # Wayland clipboard over the standard `wl_data_device`; arboard's speaks `wlr-data-control`,
 # which GNOME does not implement.
@@ -138,6 +142,10 @@ web-sys = { version = "0.3", features = [
     "AudioBuffer",
     "BaseAudioContext",
     "OfflineAudioContext",
+    # The survivors co-op link in the browser (`survivors::coop::link`).
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
 ] }
 
 # Off macOS the device layer's last hop runs over cpal (`sound::output::cpal`). macOS goes direct:

@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
             cli.upstream.clone(),
             wenilla_host::ALLOWED_PORTS,
         ))
+        .merge(wenilla_host::coop::router())
         .merge(wenilla_host::static_site::router(&cli.www));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)

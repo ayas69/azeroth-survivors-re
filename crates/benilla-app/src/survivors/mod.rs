@@ -7,6 +7,7 @@
 mod abilities;
 mod auto;
 mod cards;
+mod coop;
 mod data;
 mod enemies;
 mod grade;
@@ -39,6 +40,7 @@ impl Plugin for SurvivorsPlugin {
         // Present before `OnEnter(InWorld)`, where the UI lifecycle decides not to load FrameXML.
         app.insert_resource(crate::run_mode::CaptureMode)
             .add_plugins(grade::plugin)
+            .add_plugins(coop::plugin)
             .init_state::<Phase>()
             .init_resource::<Rng>()
             .init_resource::<Selection>()
