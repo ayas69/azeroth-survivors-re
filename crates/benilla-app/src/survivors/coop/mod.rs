@@ -234,7 +234,8 @@ impl Peer {
             vy: 0.0,
             hp: 1.0,
             max: 1.0,
-            level: 1,
+            // Unknown until their first vitals.
+            level: 0,
             dead: false,
             busy: false,
         }
@@ -271,6 +272,8 @@ pub(super) struct Coop {
     last_banner: String,
     /// Friends' visuals waiting to play.
     remote_fx: Vec<(u32, NetFx)>,
+    /// A late joiner has been brought up to the party (or found there was nothing to catch).
+    caught_up: bool,
 }
 
 impl Coop {
@@ -348,7 +351,7 @@ pub(super) fn plugin(app: &mut App) {
         .add_systems(OnEnter(Phase::Menu), close)
         .add_systems(
             Update,
-            (receive, follow_mates, follow_horde, hold_for_friends)
+            (receive, catch_up, follow_mates, follow_horde, hold_for_friends)
                 .chain()
                 .before(benilla_world::schedule::WorldStage::Input),
         )
@@ -1128,5 +1131,41 @@ fn expire(mut commands: Commands, time: Res<Time>, mut left: Query<(Entity, &mut
         if t.0 <= 0.0 {
             commands.entity(e).despawn();
         }
+    }
+}
+
+
+/// A guest joining a run already under way starts beside a friend, at the lowest level in the
+/// party, and picks a card for every level it skipped while the run holds for it.
+fn catch_up(
+    mut coop: ResMut<Coop>,
+    mut run: ResMut<Run>,
+    phase: Res<State<Phase>>,
+    mut me: Query<&mut Transform, With<Hero>>,
+) {
+    if coop.caught_up || !coop.on || coop.me == 0 || *phase.get() != Phase::Playing {
+        return;
+    }
+    if !coop.guest || coop.peers.is_empty() {
+        // Hosting, or alone in the room: this run is where everyone else catches up to.
+        coop.caught_up = true;
+        return;
+    }
+    // Wait for everyone's vitals and the host's clock.
+    if coop.peers.values().any(|p| p.level == 0 || p.pos.is_none()) || run.elapsed < 1.0 {
+        return;
+    }
+    coop.caught_up = true;
+    if let (Some(at), Ok(mut tf)) = (rise_beside(&coop), me.single_mut()) {
+        tf.translation = at;
+    }
+    let target = coop.peers.values().map(|p| p.level).min().unwrap_or(1);
+    if target > run.level {
+        let gained = target - run.level;
+        info!("survivors co-op: catching up {gained} levels to {target}");
+        run.level = target;
+        run.xp = 0.0;
+        run.pending_levels += gained;
+        run.banner = Some((format!("Joined at level {target}: pick your cards!"), 3.0));
     }
 }

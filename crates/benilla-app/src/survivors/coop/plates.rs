@@ -158,6 +158,8 @@ pub(super) fn mate_plates(
         if let Ok((mut text, mut color)) = texts.get_mut(plate.name) {
             let label = if peer.dead {
                 format!("{} (fallen)", peer.name)
+            } else if peer.level == 0 {
+                peer.name.clone()
             } else {
                 format!("{}  {}", peer.name, peer.level)
             };
