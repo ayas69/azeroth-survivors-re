@@ -305,22 +305,70 @@ impl Marks {
     }
 }
 
-/// The messages that make a local cast look like a server's.
+/// The messages that make a local cast look like a server's. What this tab's own hero casts is
+/// also logged for co-op friends to see ([`super::coop::FxLog`]).
 #[derive(SystemParam)]
-pub(super) struct Fx<'w> {
+pub(super) struct Fx<'w, 's> {
     seq: ResMut<'w, PlaySeq>,
     casts: MessageWriter<'w, CastEvent>,
     gos: MessageWriter<'w, SpellGoTargets>,
     swings: MessageWriter<'w, SwingMessage>,
     text: MessageWriter<'w, CombatTextSpawn>,
+    log: ResMut<'w, super::coop::FxLog>,
+    heroes: Query<'w, 's, (), With<super::hero::Hero>>,
+    ids: Query<'w, 's, &'static super::coop::NetId>,
 }
 
 /// More impacts than this per cast only cost frames.
 const MAX_VISUAL_HITS: usize = 12;
 
-impl Fx<'_> {
+impl Fx<'_, '_> {
+    /// A friend's effect is being played here: nothing of it goes back out.
+    pub fn mute(&mut self, mute: bool) {
+        self.log.muted = mute;
+    }
+
+    /// The co-op name for a target: 0 for the caster itself, else the shared enemy's id.
+    fn net_target(&self, caster: Entity, e: Entity) -> Option<u64> {
+        if e == caster {
+            return Some(0);
+        }
+        self.ids.get(e).ok().map(|n| n.0)
+    }
+
+    /// A ground spell's area, placed by this tab's hero: friends see it too.
+    pub fn area(&mut self, spell: u32, radius: f32, center: Vec3, secs: f32) {
+        self.log.push(super::coop::NetFx::Area {
+            s: spell,
+            r: radius,
+            p: center.into(),
+            secs,
+        });
+    }
+
+    /// A totem this tab's hero set down: friends see it too.
+    pub fn totem(&mut self, display: u32, pos: Vec3, secs: f32) {
+        self.log.push(super::coop::NetFx::Totem {
+            d: display,
+            p: pos.into(),
+            secs,
+        });
+    }
+
     /// `SMSG_SPELL_GO`: the cast kit on the caster, and a missile or an impact at each hit.
     pub fn cast(&mut self, caster: Entity, spell: u32, hits: &[Entity], dest: Option<Vec3>) {
+        if self.heroes.contains(caster) {
+            let on: Vec<u64> = hits
+                .iter()
+                .take(MAX_VISUAL_HITS)
+                .filter_map(|&e| self.net_target(caster, e))
+                .collect();
+            self.log.push(super::coop::NetFx::Cast {
+                s: spell,
+                on,
+                at: dest.map(Into::into),
+            });
+        }
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: caster,
@@ -341,6 +389,10 @@ impl Fx<'_> {
 
     /// Only the spell's impact kit, on `target`: no cast animation on anyone.
     pub fn impact(&mut self, target: Entity, spell: u32) {
+        // Every impact a tab plays on the horde comes from its own hero's spells.
+        if let Ok(id) = self.ids.get(target) {
+            self.log.push(super::coop::NetFx::Impact { s: spell, on: id.0 });
+        }
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: target,
@@ -354,6 +406,11 @@ impl Fx<'_> {
 
     /// A melee swing: the attack animation, the victim's flinch, blood and the hit sound.
     pub fn swing(&mut self, attacker: Entity, victim: Entity, damage: f32) {
+        if self.heroes.contains(attacker) {
+            if let Ok(id) = self.ids.get(victim) {
+                self.log.push(super::coop::NetFx::Swing { on: id.0 });
+            }
+        }
         let seq = self.seq.next();
         self.swings.write(SwingMessage {
             attacker,

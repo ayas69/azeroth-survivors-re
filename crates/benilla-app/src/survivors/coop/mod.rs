@@ -80,7 +80,62 @@ pub(super) enum Msg {
     Hurt { by: u64, raw: f32 },
     /// Host: a centre-screen announcement.
     Banner { text: String, secs: f32 },
+    /// What my hero's spells looked like since the last word.
+    Fx { f: Vec<NetFx> },
 }
+
+/// One visual of a friend's hero, played on their hero here. Targets are shared enemies by id,
+/// 0 being the caster itself.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "k")]
+pub(super) enum NetFx {
+    Cast {
+        s: u32,
+        on: Vec<u64>,
+        at: Option<[f32; 3]>,
+    },
+    Impact {
+        s: u32,
+        on: u64,
+    },
+    Swing {
+        on: u64,
+    },
+    Area {
+        s: u32,
+        r: f32,
+        p: [f32; 3],
+        secs: f32,
+    },
+    Totem {
+        d: u32,
+        p: [f32; 3],
+        secs: f32,
+    },
+}
+
+/// Most visuals one tab sends a frame: past it, the rest only cost bandwidth.
+const MAX_FX: usize = 48;
+
+/// This tab's hero's visuals waiting to go out ([`super::units::Fx`] fills it).
+#[derive(Resource, Default)]
+pub(super) struct FxLog {
+    pub muted: bool,
+    pub on: bool,
+    list: Vec<NetFx>,
+}
+
+impl FxLog {
+    pub fn push(&mut self, fx: NetFx) {
+        if self.on && !self.muted && self.list.len() < MAX_FX {
+            self.list.push(fx);
+        }
+    }
+}
+
+/// A friend's ground area or totem, gone after its time.
+#[derive(Component)]
+pub(super) struct Expire(f32);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(super) struct NetSpawn {
@@ -214,6 +269,8 @@ pub(super) struct Coop {
     deaths: Vec<(u64, u32)>,
     hits: Vec<NetHit>,
     last_banner: String,
+    /// Friends' visuals waiting to play.
+    remote_fx: Vec<(u32, NetFx)>,
 }
 
 impl Coop {
@@ -286,6 +343,7 @@ pub(super) struct CoopNet {
 
 pub(super) fn plugin(app: &mut App) {
     app.init_resource::<Coop>()
+        .init_resource::<FxLog>()
         .add_systems(OnEnter(Phase::Playing), open)
         .add_systems(OnEnter(Phase::Menu), close)
         .add_systems(
@@ -300,7 +358,13 @@ pub(super) fn plugin(app: &mut App) {
                 .chain()
                 .after(super::hero::hero_vitals),
         )
-        .add_systems(Update, plates::mate_plates.after(follow_mates));
+        .add_systems(Update, plates::mate_plates.after(follow_mates))
+        .add_systems(
+            Update,
+            (replay_fx, expire)
+                .after(follow_mates)
+                .before(benilla_world::schedule::WorldStage::Input),
+        );
 }
 
 /// The relay's address for this battleground, if co-op is on here.
@@ -634,6 +698,12 @@ fn receive(
             Msg::Banner { text, secs } if coop.guest => {
                 run.banner = Some((text, secs));
             }
+            Msg::Fx { f } => {
+                let room = 4 * MAX_FX;
+                if coop.remote_fx.len() < room {
+                    coop.remote_fx.extend(f.into_iter().map(|fx| (from, fx)));
+                }
+            }
             _ => {}
         }
     }
@@ -857,10 +927,22 @@ fn say(
     phase: Res<State<Phase>>,
     me: Query<(&Transform, &MovementState), With<Hero>>,
     horde: Query<(&Transform, &Enemy, &NetId)>,
+    mut log: ResMut<FxLog>,
 ) {
-    let Some(mut net) = net else { return };
+    let Some(mut net) = net else {
+        log.on = false;
+        log.list.clear();
+        return;
+    };
+    log.on = coop.on;
     if !net.link.is_open() || coop.me == 0 {
         return;
+    }
+    if !log.list.is_empty() {
+        let f = std::mem::take(&mut log.list);
+        if !coop.peers.is_empty() {
+            coop.send(Msg::Fx { f });
+        }
     }
     let dt = time.delta_secs();
     if !net.said_hello {
@@ -969,4 +1051,82 @@ pub(super) fn rise_beside(coop: &Coop) -> Option<Vec3> {
         .find(|p| p.standing())
         .and_then(|p| p.pos)
         .map(|p| p + Vec3::X * 1.5)
+}
+
+
+/// Friends' spells, played on their heroes here: the cast on the caster, missiles and impacts on
+/// the shared enemies, ground areas and totems where they were set down.
+fn replay_fx(
+    mut commands: Commands,
+    mut coop: ResMut<Coop>,
+    mut run: ResMut<Run>,
+    mut fx: Fx,
+) {
+    if coop.remote_fx.is_empty() {
+        return;
+    }
+    fx.mute(true);
+    for (from, f) in std::mem::take(&mut coop.remote_fx) {
+        let Some(caster) = coop.peers.get(&from).and_then(|p| p.entity) else {
+            continue;
+        };
+        let target = |id: u64| {
+            if id == 0 {
+                Some(caster)
+            } else {
+                coop.net.get(&id).copied()
+            }
+        };
+        match f {
+            NetFx::Cast { s, on, at } => {
+                let hits: Vec<Entity> = on.into_iter().filter_map(target).collect();
+                fx.cast(caster, s, &hits, at.map(Vec3::from));
+            }
+            NetFx::Impact { s, on } => {
+                if let Some(t) = target(on) {
+                    fx.impact(t, s);
+                }
+            }
+            NetFx::Swing { on } => {
+                if let Some(t) = target(on) {
+                    fx.swing(caster, t, 0.0);
+                }
+            }
+            NetFx::Area { s, r, p, secs } => {
+                let serial = run.guid();
+                let e = units::spawn_area_object(&mut commands, serial, s, r, Vec3::from(p));
+                commands.entity(e).insert(Expire(secs));
+            }
+            NetFx::Totem { d, p, secs } => {
+                let serial = run.guid();
+                let e = units::spawn_unit(
+                    &mut commands,
+                    &units::UnitSpec {
+                        serial,
+                        display: d,
+                        scale: 1.0,
+                        level: 60,
+                        faction: units::FACTION_FRIENDLY,
+                        bytes0: 0,
+                        weapons: &[],
+                        sheath: 0,
+                    },
+                    Vec3::from(p),
+                    0.0,
+                );
+                commands.entity(e).insert(Expire(secs));
+            }
+        }
+    }
+    fx.mute(false);
+}
+
+/// A friend's area or totem runs its time and goes.
+fn expire(mut commands: Commands, time: Res<Time>, mut left: Query<(Entity, &mut Expire)>) {
+    for (e, mut t) in &mut left {
+        t.0 -= time.delta_secs();
+        if t.0 <= 0.0 {
+            commands.entity(e).despawn();
+        }
+    }
 }

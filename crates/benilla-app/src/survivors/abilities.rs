@@ -349,6 +349,14 @@ pub(super) fn cast_abilities(
                             )
                         };
                         let burst = def.duration <= 0.0;
+                        if !def.overhead {
+                            fx.area(
+                                def.spell,
+                                p.radius,
+                                center,
+                                if burst { 1.5 } else { p.duration },
+                            );
+                        }
                         commands.entity(area).insert(GroundArea {
                             damage: p.dmg,
                             dot: p.dot,
@@ -517,6 +525,7 @@ pub(super) fn cast_abilities(
                         pos,
                         0.0,
                     );
+                    fx.totem(def.totem.0, pos, p.duration);
                     commands.entity(totem).insert(Totem {
                         cast: def.totem.1,
                         damage: p.dmg,
