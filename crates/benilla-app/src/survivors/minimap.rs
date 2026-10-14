@@ -362,6 +362,7 @@ pub(super) fn compose(
     phase: Res<State<super::Phase>>,
     hero: Query<&Transform, With<Hero>>,
     enemies: Query<(&Transform, &Enemy)>,
+    mates: Query<&Transform, With<super::coop::Mate>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     if *phase.get() == super::Phase::Menu || !map.shown {
@@ -521,12 +522,34 @@ pub(super) fn compose(
         }
     }
 
+    // Co-op friends over the horde: a green dot ringed in black, held on the rim when out of view
+    // so a friend far away still shows which way to go.
+    let size = MATE_PX * scale;
+    for tf in &mates {
+        let mut off = Vec2::new(tf.translation.x - p.x, tf.translation.z - p.z) / yd_per_px;
+        let rim = half - size * 0.6;
+        if off.length() > rim {
+            off = off.normalize_or_zero() * rim;
+        }
+        blit(buf, center + off, size, |q| {
+            let d = q.length() / (size / 2.0);
+            match d {
+                d if d <= 0.62 => Some([40.0, 255.0, 60.0, 255.0]),
+                d if d <= 1.0 => Some([0.0, 0.0, 0.0, 230.0]),
+                _ => None,
+            }
+        });
+    }
+
     if let Some(image) = images.get_mut(&map.image) {
         if let Some(data) = image.data.as_mut() {
             data.copy_from_slice(&map.buf);
         }
     }
 }
+
+/// A co-op friend's dot, in blip-basis pixels: a little bigger than an enemy's.
+const MATE_PX: f32 = 9.0;
 
 /// Alpha-blend a `size`-px square centred at `at`; `shade` maps a pixel's offset from the centre
 /// to its RGBA. The map's own alpha (the mask) is kept.
